@@ -1,11 +1,20 @@
-# KNBRIK — Gestão
+# KN Center — Gestão
 
 Sistema de estoque e sócios para loja de eletrônicos/iPhones, adaptado do modelo usado no
 sistema de gestão de carros (aclera.cars), substituindo a lógica de "1 veículo = 1 registro"
 por um modelo misto: itens únicos (iPhones por IMEI) e lotes com quantidade (acessórios).
 
-Baseado na planilha real da KNBRIK (produtos, divisão de investimento entre sócios, retorno
-por sócio, lucro por mês/semana com meta, extrato por sócio, produtos disponíveis).
+Baseado na planilha real da loja (aba "KNBRIK — Controle de Produtos": produtos, divisão de
+investimento entre sócios, retorno por sócio, lucro por mês/semana com meta, extrato por sócio,
+produtos disponíveis). "KNBRIK" era o nome de trabalho anterior — a marca agora é **KN Center**,
+com logo e ícones próprios; o layout da planilha em si não mudou, só o nome do sistema.
+
+## Deixando como app no iPhone (sem passar pela App Store)
+
+O site já vem com manifest, ícones (`apple-touch-icon.png`, `icon-192.png`, `icon-512.png`) e as
+meta tags que o iOS pede pra rodar em tela cheia, sem barra do Safari. No iPhone: abre o site no
+Safari → botão de compartilhar → **"Adicionar à Tela de Início"**. Vira um ícone igual a qualquer
+app, abre em tela cheia. Não precisa de loja de app nem de conta de desenvolvedor Apple.
 
 ## O que foi adaptado do sistema de carros e o que foi removido
 
@@ -47,7 +56,19 @@ criado vira admin e pode cadastrar o segundo sócio/usuário depois. Sócios "Ka
 vêm cadastrados por padrão (dá pra editar o nome ou adicionar mais sócios na tela de Extrato, se
 precisar).
 
-## Importar o histórico real da planilha (50 produtos já cadastrados)
+## Importar planilha (pelo site, sem terminal)
+
+Na aba **Produtos**, tem um botão **"📥 Importar planilha (.xlsx)"** ao lado de "+ Novo produto".
+Escolhe o arquivo da planilha (mesmo layout da KNBRIK, aba "Produtos") e ele importa direto —
+sem precisar de terminal, Node, Railway CLI ou nada disso. É idempotente: se importar a mesma
+planilha de novo (ou uma atualizada), produtos cujo SKU já existe são pulados, não duplica.
+
+Depois de importar, aparece um resumo na tela: quantos produtos entraram, quantas vendas foram
+registradas, e a lista de casos que precisam de conferência manual (ver mais abaixo por quê).
+
+### Alternativa via terminal (script `importar-planilha.js`)
+
+Só necessário se preferir rodar por fora do site, ou pra importar sem estar logado no navegador:
 
 ```
 npm install
@@ -58,6 +79,8 @@ node importar-planilha.js
 Isso popula o banco com os 50 produtos da planilha KNBRIK (atualizada em 16/08), a divisão de
 investimento entre Kauã e Gustavo, e as 38 vendas que já reconciliam certinho com o lucro real
 registrado na planilha. É idempotente — pode rodar de novo sem duplicar (pula SKU já existente).
+Usa o mesmo motor de reconciliação do botão do site (`importador.js`), só que a partir de um
+JSON já extraído (`import-produtos.json`) em vez de subir o arquivo .xlsx direto.
 
 **5 casos não entraram automático porque os números da própria planilha não fecham entre si** —
 ler `import-avisos.txt` pra ver os 5, mas resumindo:
@@ -82,10 +105,15 @@ ler `import-avisos.txt` pra ver os 5, mas resumindo:
 
 Sem isso, todo redeploy apaga o banco de dados.
 
-1. No serviço no Railway, vá em **Settings → Volumes**.
-2. Clique em **New Volume**.
+1. No canvas do projeto (não dentro do serviço), aperta `Ctrl+K`/`⌘K` ou clica com o botão
+   direito pra abrir o menu de criar volume.
+2. Escolhe o serviço do KNBRIK pra conectar o volume.
 3. Mount path: `/app/data`
 4. Redeploy o serviço.
+
+Volume só é montado quando o container inicia (não durante o build) — se algo escrever em
+`data/` no build, não persiste. E se a imagem não rodar como root, precisa da variável de
+ambiente `RAILWAY_RUN_UID=0` (não é o caso do `nixpacks.toml` deste projeto).
 
 `server.js` lê `DB_PATH` do ambiente (padrão: `./data/knbrik.db`). Fotos ficam em `data/uploads`,
 dentro do mesmo volume — se o volume não estiver configurado, banco e fotos somem no redeploy.

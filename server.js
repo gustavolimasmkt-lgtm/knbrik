@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const { processarPlanilha } = require('./importador');
 
 const app = express();
 app.use(express.json());
@@ -28,6 +29,15 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     if (/^image\/(jpeg|png|webp|gif)$/.test(file.mimetype)) cb(null, true);
     else cb(new Error('Apenas imagens sao permitidas'));
+  }
+});
+
+const uploadPlanilha = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (/\.xlsx$/i.test(file.originalname)) cb(null, true);
+    else cb(new Error('Envie um arquivo .xlsx'));
   }
 });
 
@@ -232,6 +242,38 @@ app.post('/api/auth/gerar-codigo-recuperacao', (req, res) => {
   ok(res, { novoCodigo });
 });
 
+// ---------- USUARIOS (quem tem acesso ao sistema) ----------
+app.get('/api/usuarios', (_, res) => {
+  ok(res, db.prepare('SELECT id, nome, email, is_admin, criado_em FROM usuarios ORDER BY criado_em').all()
+    .map(u => ({ ...u, is_admin: !!u.is_admin })));
+});
+
+app.post('/api/usuarios', (req, res) => {
+  // mesma regra do cadastro publico (endpoint /api/auth/registrar), so que exposta dentro do
+  // app pra quem ja esta logado nao precisar deslogar pra convidar outra pessoa.
+  const { nome, email, senha } = req.body;
+  if (!nome || !email || !senha) return err(res, 'Nome, email e senha obrigatorios');
+  if (senha.length < 6) return err(res, 'Senha precisa de ao menos 6 caracteres');
+  const existe = db.prepare('SELECT id FROM usuarios WHERE email=?').get(email.toLowerCase());
+  if (existe) return err(res, 'Email ja cadastrado');
+  const hash = bcrypt.hashSync(senha, 10);
+  const recoveryCode = crypto.randomBytes(6).toString('hex').toUpperCase().match(/.{1,4}/g).join('-');
+  const recoveryHash = bcrypt.hashSync(recoveryCode, 10);
+  const r = db.prepare('INSERT INTO usuarios (nome, email, senha_hash, recovery_code_hash, is_admin) VALUES (?,?,?,?,0)')
+    .run(nome, email.toLowerCase(), hash, recoveryHash);
+  ok(res, { id: r.lastInsertRowid, nome, email: email.toLowerCase(), recoveryCode });
+});
+
+app.delete('/api/usuarios/:id', (req, res) => {
+  const alvo = db.prepare('SELECT * FROM usuarios WHERE id=?').get(req.params.id);
+  if (!alvo) return err(res, 'Usuario nao encontrado', 404);
+  if (alvo.id === req.user.id) return err(res, 'Voce nao pode excluir a propria conta por aqui.');
+  const total = db.prepare('SELECT COUNT(*) as n FROM usuarios').get().n;
+  if (total <= 1) return err(res, 'Precisa sobrar pelo menos um usuario com acesso.');
+  db.prepare('DELETE FROM usuarios WHERE id=?').run(req.params.id);
+  ok(res, { id: req.params.id });
+});
+
 // ---------- SOCIOS ----------
 app.get('/api/socios', (_, res) => ok(res, db.prepare('SELECT * FROM socios ORDER BY nome').all()));
 app.post('/api/socios', (req, res) => {
@@ -347,6 +389,70 @@ app.get('/api/produtos/:id', (req, res) => {
   const produto = db.prepare('SELECT * FROM produtos WHERE id=?').get(req.params.id);
   if (!produto) return err(res, 'Produto nao encontrado', 404);
   ok(res, retratoProduto(produto));
+});
+
+// ---------- IMPORTAR PLANILHA (.xlsx) ----------
+// Sobe a planilha (mesmo layout da KNBRIK: aba "Produtos"), reconcilia os dados (quantidade
+// vendida a partir do status, vendas so entram se o valor bater com o lucro real declarado) e
+// grava direto no banco. SKUs que ja existem sao pulados (nao duplica se importar de novo).
+app.post('/api/produtos/importar-planilha', (req, res) => {
+  uploadPlanilha.single('planilha')(req, res, (uerr) => {
+    if (uerr) return err(res, uerr.message);
+    if (!req.file) return err(res, 'Nenhum arquivo enviado');
+    let resultado;
+    try {
+      resultado = processarPlanilha(req.file.buffer);
+    } catch (e) {
+      return err(res, 'Erro ao ler a planilha: ' + e.message);
+    }
+
+    function socioId(nome) {
+      let s = db.prepare('SELECT id FROM socios WHERE nome=?').get(nome);
+      if (!s) {
+        const r = db.prepare('INSERT INTO socios (nome) VALUES (?)').run(nome);
+        s = { id: r.lastInsertRowid };
+      }
+      return s.id;
+    }
+
+    let criados = 0, pulados = 0, vendasCriadas = 0;
+    try {
+      const transacao = db.transaction((produtos) => {
+        for (const p of produtos) {
+          const existente = db.prepare('SELECT id FROM produtos WHERE sku=?').get(p.sku);
+          if (existente) { pulados++; continue; }
+
+          const r = db.prepare(`INSERT INTO produtos
+            (sku,nome,categoria,condicao,quantidade_total,custo_total,data_compra,preco_anuncio,lucro_minimo,status_manual,obs,criado_por)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(p.sku, p.nome, p.categoria, p.condicao, p.quantidade_total, p.custo_total,
+                 p.data_compra, p.preco_anuncio, p.lucro_minimo, p.status_manual, p.obs, req.user.id);
+          const produtoId = r.lastInsertRowid;
+
+          const insInv = db.prepare('INSERT INTO produto_investimentos (produto_id, socio_id, valor) VALUES (?,?,?)');
+          for (const inv of p.investimentos) insInv.run(produtoId, socioId(inv.socio), inv.valor);
+
+          if (p.venda) {
+            db.prepare(`INSERT INTO vendas (produto_id,quantidade,valor_vendido,canal_venda,data_venda,obs,usuario_id)
+              VALUES (?,?,?,?,?,?,?)`)
+              .run(produtoId, p.venda.quantidade, p.venda.valor_vendido, p.venda.canal_venda, p.venda.data_venda, p.venda.obs, req.user.id);
+            db.prepare('UPDATE produtos SET quantidade_vendida = quantidade_vendida + ? WHERE id=?')
+              .run(p.venda.quantidade, produtoId);
+            vendasCriadas++;
+          }
+
+          db.prepare('INSERT INTO produtos_auditoria (produto_id,usuario_id,acao,dados_depois) VALUES (?,?,?,?)')
+            .run(produtoId, req.user.id, 'importado_da_planilha', JSON.stringify(p));
+          criados++;
+        }
+      });
+      transacao(resultado.produtos);
+    } catch (e) {
+      return err(res, 'Erro ao gravar no banco: ' + e.message, 500);
+    }
+
+    ok(res, { criados, pulados, vendasCriadas, avisos: resultado.avisos, total: resultado.produtos.length });
+  });
 });
 
 function gerarSku(db) {
@@ -701,4 +807,4 @@ app.get('*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`KNBRIK rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`KN Center rodando na porta ${PORT}`));
